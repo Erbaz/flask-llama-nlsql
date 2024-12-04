@@ -1,6 +1,7 @@
 import os
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS, cross_origin
 from flask_src.definitions.definitions import MessageType
 from flask_src.utils.chat_template import convert_to_chat_template
 from flask_src.utils.validation import validate_request_data
@@ -10,11 +11,14 @@ from llama_index.core.query_engine import NLSQLTableQueryEngine
 from sqlalchemy import create_engine, text, event
 from typing import List, Dict, Literal
 import uuid
+import re
+import json
 
 
 db_connections: Dict[str, SQLDatabase] = {}
 query_engines: Dict[str, NLSQLTableQueryEngine] = {}
 chat_histories: Dict[str, List[MessageType]] = {}
+
 
 template = (
     "We have provided context information below. \n"
@@ -22,12 +26,13 @@ template = (
     "{context_str}"
     "\n---------------------\n"
     "Given this information, please answer the question: {query_str}\n"
-    "OUTPUT_FORMAT: {\"type\": \"SUCCESS or ERROR\", \"content\": \"relevant_content\", \"contentType\": \"valid_json_supported_type\", \"tables_used\":[table names]}")
+    "OUTPUT_FORMAT: {\"type\": \"SUCCESS or ERROR\", \"message\": \"final output string\", \"contentType\": \"valid json type of message (example: string)\", \"tables_used\":[table names]}")
 
 
 def create_app(test_config=None):
     # create and configure the app
     app = Flask(__name__, instance_relative_config=True)
+    CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:5173"}})
     app.config.from_mapping(
         SECRET_KEY='dev',
     )
@@ -39,7 +44,9 @@ def create_app(test_config=None):
     
     # add connection to db
     @app.route('/connect-db', methods=['POST'])
+    @cross_origin()
     def connect_db():
+        
         data = request.json
 
         if not data:
@@ -55,13 +62,12 @@ def create_app(test_config=None):
         sql_database = SQLDatabase(engine=engine)
         id = uuid.uuid4()
         db_connections[id] = sql_database
-        print(list(db_connections.keys()))
-        return jsonify({"message": "SUCCESS", "content": {"id": id} }), 400
+        return jsonify({"message": "SUCCESS", "content": {"id": id} })
     
     # get db connection by id
     @app.route('/get-db/<db_id>', methods=['GET'])
+    @cross_origin()
     def get_db(db_id):
-        print(list(db_connections.keys()))
         try:
             db_id = uuid.UUID(db_id)  # Convert string to UUID
         except ValueError:
@@ -71,26 +77,9 @@ def create_app(test_config=None):
             return jsonify({"error": "Incorrect id provided"}), 400
         
         return jsonify({"message":"SUCCESS", "content":{"id": db_id, "db": db_connections[db_id].get_usable_table_names() }})
-    
-    @app.route('/apply-query/<db_id>', methods=["POST"])
-    def apply_query(db_id):
-        if db_id not in db_connections:
-            return jsonify({"error": "Id does not exist"}), 400
-        db = db_connections[db_id]
-        with db.engine.connect() as connection:
-            # Simple SELECT query example using SQLAlchemy `text()` for raw SQL queries
-            result = connection.execute(text("SELECT 1"))
-
-            # Fetch the results
-            rows = result.fetchall()
-            content = [dict(row) for row in result]
-
-            for row in rows:
-                print(row)
-            return jsonify({"message":"SUCCESS", "content":content})
-
 
     @app.route('/chat/gemini/register', methods=["POST"])
+    @cross_origin()
     def chat_register_gemini():
         data = request.json
 
@@ -135,6 +124,7 @@ def create_app(test_config=None):
         return jsonify({"error": "Unable to register, please try again later"}), 500
             
     @app.route('/chat/gemini/room/<chat_id>', methods=['POST'])
+    @cross_origin()
     def chat_room_gemini(chat_id):
         data = request.json
 
@@ -164,17 +154,36 @@ def create_app(test_config=None):
         query = qa_template.format(context_str=context_str, query_str=query_str)
         try:
             res = query_engine.query(query)
+            sql_query = ""
+            for query_id, query_info in res.metadata.items():
+                if('sql_query' in query_info):
+                    sql_query = query_info['sql_query']
             try:
                 response:str = res.response
+                if response.strip().startswith("```json") and response.strip().endswith("```"):
+                    match = re.search(r"```json\n(.*?)\n```", response.strip(), re.DOTALL)
+                    if match:
+                        json_string = match.group(1)
+                        try:
+                            # Parse the JSON string into a dictionary
+                            response_json = json.loads(json_string)
+
+                        except json.JSONDecodeError as e:
+                            raise ValueError(f"Error parsing JSON: {e}")
+                    else:
+                        raise ValueError("JSON content not found within markdown formatting.")
+                else:
+                    raise ValueError("Invalid markdown formatting.")
             except:
                 raise ValueError("response was invalid")
             
-            chat_histories.setdefault(chat_id, []).extend([{"user": query}, {"assistant": response}])
-            return jsonify({"message":"SUCCESS", "content": {"response": response}})
+            chat_histories.setdefault(chat_id, []).extend([{"user": query_str}, {"assistant": response + f"\nSQL Query Used:{sql_query}\n",}])
+            return jsonify({"message":"SUCCESS", "content": {"response": response_json, "sql_query": sql_query}})
         except Exception as e:
-            return jsonify({"error": "Unable to process query", "message": e}), 500
+            return jsonify({"error": "Internal Server Error", "message": "Unable to process query"}), 500
             
     @app.route('/chat/gemini/history/<chat_id>', methods=['GET'])
+    @cross_origin()
     def chat_history_gemini(chat_id):
         try:
             chat_id = uuid.UUID(chat_id)  # Convert string to UUID
